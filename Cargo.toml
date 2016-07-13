@@ -21,7 +21,7 @@ version = ">= 0.2.3"
 [dependencies]
 chrono = "0.2.21"
 hyper = "0.8.1"
-log = "0.3.6"
+log = "0.3"
 openssl = "0.7.9"
 regex = "0.1.65"
 rustc-serialize = "0.3.19"
