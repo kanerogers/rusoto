@@ -37,7 +37,7 @@ impl GenerateProtocol for RestJsonGenerator {
 
             format!("
                 {documentation}
-                pub fn {method_name}(&self, input: &{input_type}) -> AwsResult<{output_type}> {{
+                pub fn {method_name}(&self, input: &{input_type}) -> Result<{output_type}, {error_type}> {{
                     {encode_input}
 
                     {request_uri_formatter}
@@ -47,10 +47,10 @@ impl GenerateProtocol for RestJsonGenerator {
                     {load_payload}
                     {load_params}
 
-                    let mut result = request.sign_and_execute(try!(self.credentials_provider.credentials()));
-                    let status = result.status.to_u16();
-                    let mut body = String::new();
-                    result.read_to_string(&mut body).unwrap();
+                    request.sign(&try!(self.credentials_provider.credentials()));
+
+                    let result = try!(self.dispatcher.dispatch(&request));
+                    let mut body = result.body;
 
                     // `serde-json` serializes field-less structs as \"null\", but AWS returns
                     // \"{{}}\" for a field-less response, so we must check for this result
@@ -60,13 +60,13 @@ impl GenerateProtocol for RestJsonGenerator {
                     }}
 
                     debug!(\"Response body: {{}}\", body);
-                    debug!(\"Response status: {{}}\", status);
+                    debug!(\"Response status: {{}}\", result.status);
 
-                    match status {{
+                    match result.status {{
                         {status_code} => {{
                             {ok_response}
                         }}
-                        _ => Err(parse_json_protocol_error(&body)),
+                         _ => Err({error_type}::from_body(&body)),
                     }}
                 }}
                 ",
@@ -74,6 +74,7 @@ impl GenerateProtocol for RestJsonGenerator {
                 endpoint_prefix = service.metadata.endpoint_prefix,
                 http_method = operation.http.method,
                 input_type = input_type,
+                error_type = operation.error_type_name(),
                 method_name = operation.name.to_snake_case(),
                 status_code = operation.http.response_code.unwrap_or(200),
                 ok_response = generate_ok_response(operation, output_type),
@@ -90,20 +91,16 @@ impl GenerateProtocol for RestJsonGenerator {
     }
 
     fn generate_prelude(&self, _: &Service) -> String {
-        "use std::io::Read;
-
-        use serde_json;
-
-        use credential::ProvideAwsCredentials;
-        use error::{AwsResult, parse_json_protocol_error};
-        use param::{Params, ServiceParams};
-        use region;
+        "use param::{Params, ServiceParams};
         use signature::SignedRequest;
+        use serde_json;
+        use serde_json::from_str;
+        use serde_json::Value as SerdeJsonValue;
         ".to_owned()
     }
 
     fn generate_struct_attributes(&self) -> String {
-        "#[derive(Debug, Default, Deserialize, Serialize)]".to_owned()
+        "#[derive(Debug, Default, Deserialize, Serialize, Clone)]".to_owned()
     }
 
     fn timestamp_type(&self) -> &'static str {

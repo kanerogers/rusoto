@@ -12,44 +12,30 @@ impl GenerateProtocol for Ec2Generator {
         service.operations.values().map(|operation| {
             format!(
                 "{documentation}
-{method_signature} {{
-    let mut request = SignedRequest::new(
-        \"{http_method}\",
-        \"{endpoint_prefix}\",
-        self.region,
-        \"{request_uri}\",
-    );
-    let mut params = Params::new();
+                {method_signature} {{
+                    let mut request = SignedRequest::new(\"{http_method}\", \"{endpoint_prefix}\", self.region, \"{request_uri}\");
+                    let mut params = Params::new();
 
-    params.put(\"Action\", \"{operation_name}\");
-    params.put(\"Version\", \"{api_version}\");
-    {serialize_input}
+                    params.put(\"Action\", \"{operation_name}\");
+                    params.put(\"Version\", \"{api_version}\");
+    
+                    {serialize_input}
 
-    request.set_params(params);
+                    request.set_params(params);
+                    request.sign(&try!(self.credentials_provider.credentials()));
 
-    let mut result = request.sign_and_execute(try!(self.credentials_provider.credentials()));
+                    let result = try!(self.dispatcher.dispatch(&request));
 
-    if result.status.is_success() {{
-
-        let mut reader = EventReader::new(result);
-        let mut stack = XmlResponseFromAws::new(reader.events().peekable());
-        stack.next();
-        {method_return_value}
-
-    }} else {{
-
-        use std::io::Read;
-        let mut response_body = String::new();
-        if let Err(_) = result.read_to_string(&mut response_body) {{
-            response_body = String::from(\"(Non UTF-8 response)\");
-        }}
-
-        Err(AwsError::new(
-            format!(\"HTTP response for {operation_name}: {{}}: {{}}\", result.status, response_body)
-        ))
-
-    }}
-}}
+                    match result.status {{
+                        200 => {{
+                            let mut reader = EventReader::from_str(&result.body);
+                            let mut stack = XmlResponse::new(reader.events().peekable());
+                            stack.next();
+                            {method_return_value}
+                        }},
+                        _ => Err({error_type}::from_body(&result.body))
+                    }}
+                }}
                 ",
                 documentation = generate_documentation(operation),
                 http_method = &operation.http.method,
@@ -57,6 +43,7 @@ impl GenerateProtocol for Ec2Generator {
                 method_return_value = generate_method_return_value(operation),
                 method_signature = generate_method_signature(operation),
                 operation_name = &operation.name,
+                error_type = operation.error_type_name(),
                 api_version = service.metadata.api_version,
                 request_uri = &operation.http.request_uri,
                 serialize_input = generate_method_input_serialization(operation),
@@ -69,14 +56,13 @@ impl GenerateProtocol for Ec2Generator {
 
         use xml::EventReader;
 
-        use credential::ProvideAwsCredentials;
-        use error::AwsError;
         use param::{Params, ServiceParams};
-        use region;
+
         use signature::SignedRequest;
         use xml::reader::events::XmlEvent;
-        use xmlutil::{Next, Peek, XmlParseError, XmlResponseFromAws};
+        use xmlutil::{Next, Peek, XmlParseError, XmlResponse};
         use xmlutil::{characters, end_element, start_element, skip_tree};
+        use xmlerror::*;
 
         enum DeserializerNext {
             Close,
@@ -87,7 +73,7 @@ impl GenerateProtocol for Ec2Generator {
     }
 
     fn generate_struct_attributes(&self) -> String {
-        "#[derive(Debug, Default)]".to_owned()
+        "#[derive(Debug, Default, Clone)]".to_owned()
     }
 
     fn generate_support_types(&self, name: &str, shape: &Shape, _service: &Service) -> Option<String> {
@@ -165,15 +151,17 @@ fn generate_method_return_value(operation: &Operation) -> String {
 fn generate_method_signature(operation: &Operation) -> String {
     if operation.input.is_some() {
         format!(
-            "pub fn {operation_name}(&self, input: &{input_type}) -> Result<{output_type}, AwsError>",
+            "pub fn {operation_name}(&self, input: &{input_type}) -> Result<{output_type}, {error_type}>",
             input_type = operation.input.as_ref().unwrap().shape,
             operation_name = operation.name.to_snake_case(),
             output_type = &operation.output_shape_or("()"),
+            error_type = operation.error_type_name(),
         )
     } else {
         format!(
-            "pub fn {operation_name}(&self) -> Result<{output_type}, AwsError>",
+            "pub fn {operation_name}(&self) -> Result<{output_type}, {error_type}>",
             operation_name = operation.name.to_snake_case(),
+            error_type = operation.error_type_name(),
             output_type = &operation.output_shape_or("()"),
         )
     }

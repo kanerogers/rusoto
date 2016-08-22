@@ -9,39 +9,38 @@ impl GenerateProtocol for QueryGenerator {
     fn generate_methods(&self, service: &Service) -> String {
         service.operations.values().map(|operation| {
             format!(
-                "{documentation}
-{method_signature} {{
-    let mut request = SignedRequest::new(
-        \"{http_method}\",
-        \"{endpoint_prefix}\",
-        self.region,
-        \"{request_uri}\",
-    );
-    let mut params = Params::new();
+                "
+                {documentation}
+                {method_signature} {{
+                    let mut request = SignedRequest::new(\"{http_method}\", \"{endpoint_prefix}\", self.region, \"{request_uri}\");
+                    let mut params = Params::new();
 
-    params.put(\"Action\", \"{operation_name}\");
-    {serialize_input}
+                    params.put(\"Action\", \"{operation_name}\");
+                    {serialize_input}
+                    request.set_params(params);
 
-    request.set_params(params);
+                    request.sign(&try!(self.credentials_provider.credentials()));
+                    let result = try!(self.dispatcher.dispatch(&request));
 
-    let result = request.sign_and_execute(try!(self.credentials_provider.credentials()));
-    let status = result.status.to_u16();
-    let mut reader = EventReader::new(result);
-    let mut stack = XmlResponseFromAws::new(reader.events().peekable());
-    stack.next();
-    stack.next();
+                    let mut reader = EventReader::from_str(&result.body);
+                    let mut stack = XmlResponse::new(reader.events().peekable());
 
-    match status {{
-        200 => {{
-            {method_return_value}
-        }}
-        status_code => Err(AwsError::new(
-            format!(\"HTTP response code for {operation_name}: {{}}\", status_code)
-        ))
-    }}
-}}
+                    let _start_document = stack.next();
+                    let _response_envelope = stack.next();
+
+                    match result.status {{
+                        200 => {{
+                            {method_return_value}
+                        }}
+                        _ => {{
+                            Err({error_type}::from_body(&result.body))
+                        }}
+                    }}
+
+                }}
                 ",
                 documentation = generate_documentation(operation),
+                error_type = operation.error_type_name(),
                 http_method = &operation.http.method,
                 endpoint_prefix = &service.metadata.endpoint_prefix,
                 method_return_value = generate_method_return_value(operation),
@@ -56,21 +55,18 @@ impl GenerateProtocol for QueryGenerator {
     fn generate_prelude(&self, _: &Service) -> String {
         "use std::collections::HashMap;
         use std::str::{FromStr, from_utf8};
-
         use xml::EventReader;
 
-        use credential::ProvideAwsCredentials;
-        use error::AwsError;
         use param::{Params, ServiceParams};
-        use region;
         use signature::SignedRequest;
-        use xmlutil::{Next, Peek, XmlParseError, XmlResponseFromAws};
+        use xmlutil::{Next, Peek, XmlParseError, XmlResponse};
         use xmlutil::{characters, end_element, peek_at_name, start_element};
+        use xmlerror::*;
         ".to_owned()
     }
 
     fn generate_struct_attributes(&self) -> String {
-        "#[derive(Debug, Default)]".to_owned()
+        "#[derive(Debug, Default, Clone)]".to_owned()
     }
 
     fn generate_support_types(&self, name: &str, shape: &Shape, service: &Service) -> Option<String> {
@@ -136,16 +132,18 @@ fn generate_method_return_value(operation: &Operation) -> String {
 fn generate_method_signature(operation: &Operation) -> String {
     if operation.input.is_some() {
         format!(
-            "pub fn {operation_name}(&self, input: &{input_type}) -> Result<{output_type}, AwsError>",
+            "pub fn {operation_name}(&self, input: &{input_type}) -> Result<{output_type}, {error_type}>",
             input_type = operation.input.as_ref().unwrap().shape,
             operation_name = operation.name.to_snake_case(),
             output_type = &operation.output_shape_or("()"),
+            error_type = operation.error_type_name(),
         )
     } else {
         format!(
-            "pub fn {operation_name}(&self) -> Result<{output_type}, AwsError>",
+            "pub fn {operation_name}(&self) -> Result<{output_type}, {error_type}>",
             operation_name = operation.name.to_snake_case(),
             output_type = &operation.output_shape_or("()"),
+            error_type = operation.error_type_name(),
         )
     }
 }
@@ -337,7 +335,8 @@ fn generate_serializer_signature(name: &str, shape: &Shape) -> String {
 fn generate_list_serializer(shape: &Shape) -> String {
     format!(
         "for (index, element) in obj.iter().enumerate() {{
-    let key = format!(\"{{}}.{{}}\", name, index);
+    // Lists are one-based, see example here: http://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html
+    let key = format!(\"{{}}.{{}}\", name, index+1);
     {name}Serializer::serialize(params, &key, element);
 }}
         ",

@@ -6,7 +6,9 @@ use self::ec2::Ec2Generator;
 use self::json::JsonGenerator;
 use self::query::QueryGenerator;
 use self::rest_json::RestJsonGenerator;
+use self::error_types::{GenerateErrorTypes, JsonErrorTypes, XmlErrorTypes};
 
+mod error_types;
 mod ec2;
 mod json;
 mod query;
@@ -24,10 +26,6 @@ pub trait GenerateProtocol {
         None
     }
 
-    fn generate_error_types(&self, _service: &Service) -> Option<String> {
-        None
-    }
-
     fn generate_additional_annotations(&self, _service: &Service, _shape_name: &str, _type_name: &str) -> Vec<String> {
         Vec::<String>::with_capacity(0)
     }
@@ -37,17 +35,28 @@ pub trait GenerateProtocol {
 
 pub fn generate_source(service: &Service) -> String {
     match &service.metadata.protocol[..] {
-        "json" => generate(service, JsonGenerator),
-        "ec2" => generate(service, Ec2Generator),
-        "query" => generate(service, QueryGenerator),
-        "rest-json" => generate(service, RestJsonGenerator),
+        "json" => generate(service, JsonGenerator, JsonErrorTypes),
+        "ec2" => generate(service, Ec2Generator, XmlErrorTypes),
+        "query" => generate(service, QueryGenerator, XmlErrorTypes),
+        "rest-json" => generate(service, RestJsonGenerator, JsonErrorTypes),
         protocol => panic!("Unknown protocol {}", protocol),
     }
 }
 
-fn generate<P>(service: &Service, protocol_generator: P) -> String where P: GenerateProtocol {
+fn generate<P, E>(service: &Service, protocol_generator: P, error_type_generator: E) -> String where P: GenerateProtocol,  E: GenerateErrorTypes {
     format!(
-        "{prelude}
+        "
+        use hyper::Client;
+        use hyper::client::RedirectPolicy;
+        use request::DispatchSignedRequest;
+        use region;
+
+        use std::fmt;
+        use std::error::Error;
+        use credential::{{CredentialsError, ProvideAwsCredentials}};
+        use request::HttpDispatchError;
+
+        {prelude}
 
         {types}
         {error_types}
@@ -56,7 +65,7 @@ fn generate<P>(service: &Service, protocol_generator: P) -> String where P: Gene
         client = generate_client(service, &protocol_generator),
         prelude = &protocol_generator.generate_prelude(service),
         types = generate_types(service, &protocol_generator),
-        error_types = protocol_generator.generate_error_types(service).unwrap_or("".to_string()),
+        error_types = error_type_generator.generate_error_types(service).unwrap_or("".to_string()),
     )
 }
 
@@ -64,19 +73,28 @@ fn generate_client<P>(service: &Service, protocol_generator: &P) -> String
 where P: GenerateProtocol {
     format!(
         "/// A client for the {service_name} API.
-        pub struct {type_name}<P> where P: ProvideAwsCredentials {{
+        pub struct {type_name}<P, D> where P: ProvideAwsCredentials, D: DispatchSignedRequest {{
             credentials_provider: P,
             region: region::Region,
+            dispatcher: D,
         }}
 
-        impl<P> {type_name}<P> where P: ProvideAwsCredentials {{
+        impl<P> {type_name}<P, Client> where P: ProvideAwsCredentials {{
             pub fn new(credentials_provider: P, region: region::Region) -> Self {{
-                {type_name} {{
+                let mut client = Client::new();                
+                client.set_redirect_policy(RedirectPolicy::FollowNone);
+               {type_name}::with_request_dispatcher(client, credentials_provider, region)
+            }}
+        }}
+
+        impl<P, D> {type_name}<P, D> where P: ProvideAwsCredentials, D: DispatchSignedRequest {{
+            pub fn with_request_dispatcher(request_dispatcher: D, credentials_provider: P, region: region::Region) -> Self {{
+                  {type_name} {{
                     credentials_provider: credentials_provider,
                     region: region,
+                    dispatcher: request_dispatcher
                 }}
             }}
-
             {methods}
         }}
         ",
@@ -127,11 +145,9 @@ where P: GenerateProtocol {
             return protocol_generator.generate_support_types(&type_name, shape, &service);
         }
 
-        if shape.exception() && service.typed_errors() {
+        if shape.exception() {
             return None;
         }
-
-
 
         let mut parts = Vec::with_capacity(3);
 
@@ -239,7 +255,11 @@ fn generate_struct_fields<P>(service: &Service, shape: &Shape, shape_name: &str,
 
 impl Operation {
     pub fn error_type_name(&self) -> String {
-        format!("{}Error", self.name)
+        match &self.name[..] {
+            // EC2 has a different struct type called CancelSpotFleetRequestsError
+            "CancelSpotFleetRequests" => "CancelSpotFleetRequestsErrorType".to_owned(),
+            _ => format!("{}Error", self.name)
+        }
     }
 }
 
